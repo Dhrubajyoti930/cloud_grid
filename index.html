@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>100x100 Cloud Canvas (Mobile)</title>
+    <title>100x100 Cloud Canvas (IP Quota & Voting)</title>
     <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         body {
@@ -14,7 +14,8 @@
             user-select: none;
         }
         h1 { margin: 10px 0 5px 0; font-size: 24px; text-align: center; }
-        #status { margin-bottom: 15px; font-weight: bold; color: #feca57; font-size: 14px; text-align: center; }
+        #status { margin-bottom: 5px; font-weight: bold; color: #feca57; font-size: 14px; text-align: center; }
+        #ipInfo { margin-bottom: 15px; font-size: 12px; color: #b2bec3; text-align: center; }
         
         canvas {
             width: 100%; max-width: 500px;
@@ -46,13 +47,27 @@
 
         .stats { font-size: 18px; font-weight: bold; }
         .pixel-count { color: #00d2d3; font-size: 26px; }
-        .warning { color: #ff7675; font-size: 16px; font-weight: bold; margin-top: 15px; min-height: 20px; text-align: center;}
+        .warning { color: #ff7675; font-size: 16px; font-weight: bold; margin-top: 10px; min-height: 20px; text-align: center;}
+        
+        .vote-section {
+            display: flex; flex-direction: column; align-items: center; gap: 8px;
+            margin-top: 10px; width: 100%; border-top: 1px solid #636e72; padding-top: 15px;
+        }
+        .vote-btn {
+            background-color: #d63031; color: white; border: none; padding: 10px 20px;
+            border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .vote-btn:hover { background-color: #ff7675; }
+        .vote-btn:disabled { background-color: #636e72; cursor: not-allowed; }
+        .vote-count { font-size: 14px; color: #ffeaa7; }
     </style>
 </head>
 <body>
 
     <h1>Global Cloud Grid</h1>
-    <div id="status">Connecting to Cloud...</div>
+    <div id="status">Fetching IP...</div>
+    <div id="ipInfo"></div>
     
     <canvas id="pixelCanvas" width="100" height="100"></canvas>
 
@@ -64,13 +79,21 @@
             <label>Select Color:</label>
             <input type="color" id="colorPicker" value="#000000">
         </div>
+        
+        <div class="vote-section">
+            <button id="voteBtn" class="vote-btn" onclick="castVote()">Vote to Clear Board</button>
+            <div id="voteCountText" class="vote-count">Votes: 0 / 10</div>
+        </div>
     </div>
     
     <div id="warning" class="warning"></div>
 
     <script>
-        const client = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
-        const cloudTopic = 'global-pixel-canvas-100x100-public-v4'; // Incremented to v4
+        const cloudTopic = 'global-pixel-canvas-100x100-public-v6'; // Incremented to v6
+        const votesTopic = 'global-pixel-canvas-votes-v6';
+        let quotaTopic = '';
+        let client = null;
+        let myIp = '';
 
         const canvas = document.getElementById('pixelCanvas');
         const ctx = canvas.getContext('2d');
@@ -79,69 +102,127 @@
         
         const MAX_PIXELS = 30;
         let localGrid = {}; 
-        let pixelsLeft = MAX_PIXELS;
+        let votes = {}; // Tracks IPs that have voted
+        
+        // IP-based Quota State
+        let basePixels = MAX_PIXELS;
+        let baseTime = Date.now();
+        let currentPixelsLeft = MAX_PIXELS;
 
         let isDrawing = false;
         let lastDrawnX = -1;
         let lastDrawnY = -1;
-        let needsSync = false; // Prevents server lag by batching updates
-
-        // --- NEW: Unacked pixels tracking ---
+        let needsSync = false;
         let unackedPixels = {};
         let clearUnackedTimeout = null;
 
-        // --- PIXEL TRACKING ---
-        function loadPixelData() {
-            let savedPixels = localStorage.getItem('pixelsLeft');
-            let lastUpdate = localStorage.getItem('lastUpdateTime');
+        // --- INITIALIZATION & IP FETCH ---
+        async function init() {
+            let displayIp = 'Unknown IP';
+            try {
+                const res = await fetch('https://api.ipify.org?format=json');
+                const data = await res.json();
+                displayIp = data.ip;
+                myIp = data.ip.replace(/[^a-zA-Z0-9]/g, '-');
+            } catch(e) {
+                console.warn("Could not fetch IP, using fallback");
+                myIp = 'fallback-' + Math.floor(Math.random() * 100000);
+            }
+
+            document.getElementById('ipInfo').innerText = `Your IP: ${displayIp} (Quota & Votes tied to IP)`;
+            quotaTopic = `global-pixel-canvas-quota-v6/${myIp}`;
+
+            // Connect to MQTT
+            client = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
+
+            client.on('connect', () => {
+                document.getElementById('status').innerText = "Connected to Cloud! (Live)";
+                document.getElementById('status').style.color = "#00b894";
+                client.subscribe(cloudTopic);
+                client.subscribe(quotaTopic); // Subscribe to personal IP quota
+                client.subscribe(votesTopic); // Subscribe to global clear votes
+            });
+
+            client.on('message', (topic, message) => {
+                if (topic === cloudTopic) {
+                    try {
+                        let incomingGrid = JSON.parse(message.toString());
+                        localGrid = { ...incomingGrid, ...unackedPixels };
+                        renderCanvas();
+                    } catch(e) { console.error("Error loading cloud data"); }
+                } else if (topic === quotaTopic) {
+                    try {
+                        let data = JSON.parse(message.toString());
+                        basePixels = data.basePixels;
+                        baseTime = data.baseTime;
+                        calculatePixels();
+                    } catch(e) { console.error("Error loading quota data"); }
+                } else if (topic === votesTopic) {
+                    try {
+                        votes = JSON.parse(message.toString());
+                        updateVoteUI();
+                        
+                        // If 10 or more votes are reached, clear the local board
+                        // (The 10th voter will publish the empty grid to cloudTopic)
+                        if (Object.keys(votes).length >= 10) {
+                            localGrid = {};
+                            unackedPixels = {};
+                            renderCanvas();
+                        }
+                    } catch(e) { console.error("Error loading votes data"); }
+                }
+            });
+        }
+
+        // --- VOTING LOGIC ---
+        function updateVoteUI() {
+            const count = Object.keys(votes).length;
+            document.getElementById('voteCountText').innerText = `Votes: ${count} / 10`;
             
-            if (savedPixels !== null && lastUpdate !== null) {
-                let secondsPassed = Math.floor((Date.now() - parseInt(lastUpdate)) / 1000);
-                pixelsLeft = Math.min(MAX_PIXELS, parseInt(savedPixels) + Math.floor(secondsPassed / 3));
+            const btn = document.getElementById('voteBtn');
+            if (votes[myIp]) {
+                btn.disabled = true;
+                btn.innerText = "Voted";
+            } else {
+                btn.disabled = false;
+                btn.innerText = "Vote to Clear Board";
             }
-            updatePixelUI();
         }
 
-        function savePixelData() {
-            localStorage.setItem('pixelsLeft', pixelsLeft);
-            localStorage.setItem('lastUpdateTime', Date.now());
-            updatePixelUI();
+        function castVote() {
+            if (!myIp || votes[myIp]) return;
+            
+            votes[myIp] = true;
+            const count = Object.keys(votes).length;
+            
+            if (count >= 10) {
+                // We are the 10th vote! Clear the board and reset votes globally.
+                client.publish(cloudTopic, JSON.stringify({}), { retain: true });
+                client.publish(votesTopic, JSON.stringify({}), { retain: true });
+                
+                // Clear locally immediately
+                localGrid = {};
+                unackedPixels = {};
+                renderCanvas();
+            } else {
+                // Publish the updated votes object
+                client.publish(votesTopic, JSON.stringify(votes), { retain: true });
+            }
+            
+            updateVoteUI();
         }
 
-        function updatePixelUI() {
-            pixelCountText.innerText = pixelsLeft;
+        // --- PIXEL QUOTA LOGIC ---
+        function calculatePixels() {
+            let secondsPassed = Math.floor((Date.now() - baseTime) / 1000);
+            currentPixelsLeft = Math.min(MAX_PIXELS, basePixels + Math.floor(secondsPassed / 3));
+            pixelCountText.innerText = currentPixelsLeft;
         }
+
+        setInterval(calculatePixels, 1000);
 
         setInterval(() => {
-            if (pixelsLeft < MAX_PIXELS) {
-                pixelsLeft++;
-                savePixelData();
-            }
-        }, 3000);
-
-        loadPixelData();
-
-        // --- CLOUD SYNC LOGIC ---
-        client.on('connect', () => {
-            document.getElementById('status').innerText = "Connected to Cloud! (Live)";
-            document.getElementById('status').style.color = "#00b894";
-            client.subscribe(cloudTopic);
-        });
-
-        client.on('message', (topic, message) => {
-            if (topic === cloudTopic) {
-                try {
-                    let incomingGrid = JSON.parse(message.toString());
-                    // Merge incoming grid with our local grid, but preserve our unacked pixels
-                    localGrid = { ...incomingGrid, ...unackedPixels };
-                    renderCanvas();
-                } catch(e) { console.error("Error loading cloud data"); }
-            }
-        });
-
-        // Batch upload to prevent server lag (Max 2 times a second while drawing)
-        setInterval(() => {
-            if (needsSync) {
+            if (needsSync && client) {
                 client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
                 needsSync = false;
             }
@@ -157,7 +238,6 @@
             }
         }
 
-        // Bresenham's Line Algorithm (Fills the gaps when you drag your finger fast)
         function getLinePixels(x0, y0, x1, y1) {
             let pixels = [];
             let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
@@ -184,13 +264,11 @@
             const x = Math.floor((e.clientX - rect.left) * scaleX);
             const y = Math.floor((e.clientY - rect.top) * scaleY);
 
-            // Prevent out-of-bounds drawing
             if (x < 0 || x >= 100 || y < 0 || y >= 100) return;
 
             const color = document.getElementById('colorPicker').value;
             let pointsToDraw = [];
 
-            // If we just clicked down, just draw the 1 pixel. If dragging, draw a line between gaps.
             if (lastDrawnX === -1) {
                 pointsToDraw.push({x, y});
             } else {
@@ -198,21 +276,27 @@
             }
 
             let modified = false;
+            let quotaModified = false;
 
             for (let pt of pointsToDraw) {
-                if (pixelsLeft <= 0) {
+                calculatePixels(); 
+                if (currentPixelsLeft <= 0) {
                     warningText.innerText = "Out of pixels! Wait to regenerate.";
                     setTimeout(() => warningText.innerText = "", 2000);
                     break;
                 }
 
                 let key = `${pt.x},${pt.y}`;
-                // Only use a pixel if we are coloring an empty space or changing an existing color
                 if (localGrid[key] !== color) {
                     localGrid[key] = color;
-                    unackedPixels[key] = color; // Track unacked pixel
-                    pixelsLeft--;
+                    unackedPixels[key] = color;
+                    
+                    currentPixelsLeft--;
+                    basePixels = currentPixelsLeft;
+                    baseTime = Date.now();
+                    
                     modified = true;
+                    quotaModified = true;
                 }
             }
 
@@ -220,9 +304,12 @@
             lastDrawnY = y;
 
             if (modified) {
-                savePixelData();
                 renderCanvas();
-                needsSync = true; // Flags it so the setInterval loop handles the publish
+                needsSync = true;
+            }
+            
+            if (quotaModified && client) {
+                client.publish(quotaTopic, JSON.stringify({ basePixels, baseTime }), { retain: true });
             }
         }
 
@@ -242,13 +329,11 @@
             lastDrawnX = -1;
             lastDrawnY = -1;
             
-            // Force an immediate sync when finger is lifted
-            if (needsSync) {
+            if (needsSync && client) {
                 client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
                 needsSync = false;
             }
             
-            // Clear unacked pixels after a delay to allow server to echo
             if (clearUnackedTimeout) clearTimeout(clearUnackedTimeout);
             clearUnackedTimeout = setTimeout(() => {
                 unackedPixels = {};
@@ -259,6 +344,8 @@
         canvas.addEventListener('pointerleave', stopDrawing);
         canvas.addEventListener('pointercancel', stopDrawing);
         
+        // Start the app
+        init();
     </script>
 </body>
 </html>
