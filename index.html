@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>100x100 Cloud Canvas (Mobile)</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body {
+            background-color: #1e1e24; color: #ffffff;
+            font-family: 'Segoe UI', sans-serif;
+            display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+            min-height: 100vh; margin: 0; padding: 10px; box-sizing: border-box;
+            user-select: none;
+        }
+        h1 { margin: 10px 0 5px 0; font-size: 24px; text-align: center; }
+        #status { margin-bottom: 15px; font-weight: bold; color: #feca57; font-size: 14px; text-align: center; }
+        
+        canvas {
+            width: 100%; max-width: 500px;
+            aspect-ratio: 1 / 1; height: auto;
+            background-color: #ffffff;
+            image-rendering: pixelated;
+            border: 4px solid #636e72;
+            border-radius: 4px;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+            touch-action: none; cursor: crosshair;
+        }
+
+        .ui-panel {
+            margin-top: 20px; 
+            display: flex; flex-direction: column; align-items: center; gap: 15px;
+            background: #2d3436; padding: 15px; border-radius: 8px;
+            border: 2px solid #636e72;
+            width: 100%; max-width: 400px; box-sizing: border-box;
+        }
+        .color-row {
+            display: flex; align-items: center; gap: 15px; font-size: 18px; font-weight: bold;
+        }
+        input[type="color"] {
+            border: 2px solid #fff; width: 60px; height: 60px; border-radius: 50%;
+            cursor: pointer; padding: 0; background: none;
+        }
+        input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+        input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
+
+        .stats { font-size: 18px; font-weight: bold; }
+        .pixel-count { color: #00d2d3; font-size: 26px; }
+        .warning { color: #ff7675; font-size: 16px; font-weight: bold; margin-top: 15px; min-height: 20px; text-align: center;}
+    </style>
+</head>
+<body>
+
+    <h1>Global Cloud Grid</h1>
+    <div id="status">Connecting to Cloud...</div>
+    
+    <canvas id="pixelCanvas" width="100" height="100"></canvas>
+
+    <div class="ui-panel">
+        <div class="stats">
+            Pixels Available: <span id="pixelCount" class="pixel-count">30</span> / 30
+        </div>
+        <div class="color-row">
+            <label>Select Color:</label>
+            <input type="color" id="colorPicker" value="#000000">
+        </div>
+    </div>
+    
+    <div id="warning" class="warning"></div>
+
+    <script>
+        const client = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
+        const cloudTopic = 'global-pixel-canvas-100x100-public-v4'; // Incremented to v4
+
+        const canvas = document.getElementById('pixelCanvas');
+        const ctx = canvas.getContext('2d');
+        const pixelCountText = document.getElementById('pixelCount');
+        const warningText = document.getElementById('warning');
+        
+        const MAX_PIXELS = 30;
+        let localGrid = {}; 
+        let pixelsLeft = MAX_PIXELS;
+
+        let isDrawing = false;
+        let lastDrawnX = -1;
+        let lastDrawnY = -1;
+        let needsSync = false; // Prevents server lag by batching updates
+
+        // --- NEW: Unacked pixels tracking ---
+        let unackedPixels = {};
+        let clearUnackedTimeout = null;
+
+        // --- PIXEL TRACKING ---
+        function loadPixelData() {
+            let savedPixels = localStorage.getItem('pixelsLeft');
+            let lastUpdate = localStorage.getItem('lastUpdateTime');
+            
+            if (savedPixels !== null && lastUpdate !== null) {
+                let secondsPassed = Math.floor((Date.now() - parseInt(lastUpdate)) / 1000);
+                pixelsLeft = Math.min(MAX_PIXELS, parseInt(savedPixels) + Math.floor(secondsPassed / 3));
+            }
+            updatePixelUI();
+        }
+
+        function savePixelData() {
+            localStorage.setItem('pixelsLeft', pixelsLeft);
+            localStorage.setItem('lastUpdateTime', Date.now());
+            updatePixelUI();
+        }
+
+        function updatePixelUI() {
+            pixelCountText.innerText = pixelsLeft;
+        }
+
+        setInterval(() => {
+            if (pixelsLeft < MAX_PIXELS) {
+                pixelsLeft++;
+                savePixelData();
+            }
+        }, 3000);
+
+        loadPixelData();
+
+        // --- CLOUD SYNC LOGIC ---
+        client.on('connect', () => {
+            document.getElementById('status').innerText = "Connected to Cloud! (Live)";
+            document.getElementById('status').style.color = "#00b894";
+            client.subscribe(cloudTopic);
+        });
+
+        client.on('message', (topic, message) => {
+            if (topic === cloudTopic) {
+                try {
+                    let incomingGrid = JSON.parse(message.toString());
+                    // Merge incoming grid with our local grid, but preserve our unacked pixels
+                    localGrid = { ...incomingGrid, ...unackedPixels };
+                    renderCanvas();
+                } catch(e) { console.error("Error loading cloud data"); }
+            }
+        });
+
+        // Batch upload to prevent server lag (Max 2 times a second while drawing)
+        setInterval(() => {
+            if (needsSync) {
+                client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
+                needsSync = false;
+            }
+        }, 500); 
+
+        // --- DRAWING LOGIC ---
+        function renderCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            for (let coord in localGrid) {
+                let parts = coord.split(',');
+                ctx.fillStyle = localGrid[coord];
+                ctx.fillRect(parseInt(parts[0]), parseInt(parts[1]), 1, 1);
+            }
+        }
+
+        // Bresenham's Line Algorithm (Fills the gaps when you drag your finger fast)
+        function getLinePixels(x0, y0, x1, y1) {
+            let pixels = [];
+            let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+            let sx = (x0 < x1) ? 1 : -1, sy = (y0 < y1) ? 1 : -1;
+            let err = dx - dy;
+
+            while (true) {
+                pixels.push({x: x0, y: y0});
+                if (x0 === x1 && y0 === y1) break;
+                let e2 = 2 * err;
+                if (e2 > -dy) { err -= dy; x0 += sx; }
+                if (e2 < dx) { err += dx; y0 += sy; }
+            }
+            return pixels;
+        }
+
+        function handleDraw(e) {
+            if (!isDrawing) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            // Prevent out-of-bounds drawing
+            if (x < 0 || x >= 100 || y < 0 || y >= 100) return;
+
+            const color = document.getElementById('colorPicker').value;
+            let pointsToDraw = [];
+
+            // If we just clicked down, just draw the 1 pixel. If dragging, draw a line between gaps.
+            if (lastDrawnX === -1) {
+                pointsToDraw.push({x, y});
+            } else {
+                pointsToDraw = getLinePixels(lastDrawnX, lastDrawnY, x, y);
+            }
+
+            let modified = false;
+
+            for (let pt of pointsToDraw) {
+                if (pixelsLeft <= 0) {
+                    warningText.innerText = "Out of pixels! Wait to regenerate.";
+                    setTimeout(() => warningText.innerText = "", 2000);
+                    break;
+                }
+
+                let key = `${pt.x},${pt.y}`;
+                // Only use a pixel if we are coloring an empty space or changing an existing color
+                if (localGrid[key] !== color) {
+                    localGrid[key] = color;
+                    unackedPixels[key] = color; // Track unacked pixel
+                    pixelsLeft--;
+                    modified = true;
+                }
+            }
+
+            lastDrawnX = x;
+            lastDrawnY = y;
+
+            if (modified) {
+                savePixelData();
+                renderCanvas();
+                needsSync = true; // Flags it so the setInterval loop handles the publish
+            }
+        }
+
+        // --- TOUCH & MOUSE EVENTS ---
+        canvas.addEventListener('pointerdown', (e) => {
+            isDrawing = true;
+            if (clearUnackedTimeout) clearTimeout(clearUnackedTimeout);
+            handleDraw(e);
+        });
+
+        canvas.addEventListener('pointermove', (e) => {
+            handleDraw(e);
+        });
+
+        const stopDrawing = () => {
+            isDrawing = false;
+            lastDrawnX = -1;
+            lastDrawnY = -1;
+            
+            // Force an immediate sync when finger is lifted
+            if (needsSync) {
+                client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
+                needsSync = false;
+            }
+            
+            // Clear unacked pixels after a delay to allow server to echo
+            if (clearUnackedTimeout) clearTimeout(clearUnackedTimeout);
+            clearUnackedTimeout = setTimeout(() => {
+                unackedPixels = {};
+            }, 2000);
+        };
+
+        canvas.addEventListener('pointerup', stopDrawing);
+        canvas.addEventListener('pointerleave', stopDrawing);
+        canvas.addEventListener('pointercancel', stopDrawing);
+        
+    </script>
+</body>
+</html>
