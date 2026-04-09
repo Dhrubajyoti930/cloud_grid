@@ -26,6 +26,15 @@
             border-radius: 4px;
             box-shadow: 0 10px 20px rgba(0,0,0,0.5);
             touch-action: none; cursor: crosshair;
+            transition: opacity 0.3s ease;
+        }
+
+        /* Class applied when offline to prevent drawing */
+        .disabled-ui {
+            opacity: 0.4;
+            pointer-events: none; /* Disables all clicking/dragging */
+            cursor: not-allowed;
+            filter: grayscale(80%);
         }
 
         .ui-panel {
@@ -44,6 +53,7 @@
         }
         input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
         input[type="color"]::-webkit-color-swatch { border: none; border-radius: 50%; }
+        input[type="color"]:disabled { opacity: 0.5; cursor: not-allowed; }
 
         .stats { font-size: 18px; font-weight: bold; }
         .pixel-count { color: #00d2d3; font-size: 26px; }
@@ -59,17 +69,18 @@
             transition: background-color 0.2s;
         }
         .vote-btn:hover { background-color: #ff7675; }
-        .vote-btn:disabled { background-color: #636e72; cursor: not-allowed; }
+        .vote-btn:disabled { background-color: #636e72; cursor: not-allowed; opacity: 0.7; }
         .vote-count { font-size: 14px; color: #ffeaa7; }
     </style>
 </head>
 <body>
 
     <h1>Global Cloud Grid</h1>
-    <div id="status">Fetching IP...</div>
+    <div id="status">Fetching IP & Connecting...</div>
     <div id="ipInfo"></div>
     
-    <canvas id="pixelCanvas" width="100" height="100"></canvas>
+    <!-- Added disabled class initially -->
+    <canvas id="pixelCanvas" class="disabled-ui" width="100" height="100"></canvas>
 
     <div class="ui-panel">
         <div class="stats">
@@ -77,11 +88,11 @@
         </div>
         <div class="color-row">
             <label>Select Color:</label>
-            <input type="color" id="colorPicker" value="#000000">
+            <input type="color" id="colorPicker" value="#000000" disabled>
         </div>
         
         <div class="vote-section">
-            <button id="voteBtn" class="vote-btn" onclick="castVote()">Vote to Clear Board</button>
+            <button id="voteBtn" class="vote-btn" onclick="castVote()" disabled>Vote to Clear Board</button>
             <div id="voteCountText" class="vote-count">Votes: 0 / 10</div>
         </div>
     </div>
@@ -89,22 +100,25 @@
     <div id="warning" class="warning"></div>
 
     <script>
-        const cloudTopic = 'global-pixel-canvas-100x100-public-v6'; // Incremented to v6
+        const cloudTopic = 'global-pixel-canvas-100x100-public-v6'; 
         const votesTopic = 'global-pixel-canvas-votes-v6';
         let quotaTopic = '';
         let client = null;
         let myIp = '';
+        let isConnected = false; // Tracks actual server connection
 
         const canvas = document.getElementById('pixelCanvas');
+        const colorPicker = document.getElementById('colorPicker');
+        const voteBtn = document.getElementById('voteBtn');
+        const statusText = document.getElementById('status');
         const ctx = canvas.getContext('2d');
         const pixelCountText = document.getElementById('pixelCount');
         const warningText = document.getElementById('warning');
         
         const MAX_PIXELS = 30;
         let localGrid = {}; 
-        let votes = {}; // Tracks IPs that have voted
+        let votes = {}; 
         
-        // IP-based Quota State
         let basePixels = MAX_PIXELS;
         let baseTime = Date.now();
         let currentPixelsLeft = MAX_PIXELS;
@@ -115,6 +129,24 @@
         let needsSync = false;
         let unackedPixels = {};
         let clearUnackedTimeout = null;
+
+        // --- MANAGE UI STATE BASED ON CONNECTION ---
+        function setConnectionState(online) {
+            isConnected = online;
+            if (online) {
+                statusText.innerText = "Connected to Cloud! (Live)";
+                statusText.style.color = "#00b894";
+                canvas.classList.remove('disabled-ui');
+                colorPicker.disabled = false;
+                updateVoteUI(); // Re-enable vote button if they haven't voted
+            } else {
+                statusText.innerText = "Offline - Reconnecting...";
+                statusText.style.color = "#ff7675";
+                canvas.classList.add('disabled-ui');
+                colorPicker.disabled = true;
+                voteBtn.disabled = true;
+            }
+        }
 
         // --- INITIALIZATION & IP FETCH ---
         async function init() {
@@ -132,16 +164,20 @@
             document.getElementById('ipInfo').innerText = `Your IP: ${displayIp} (Quota & Votes tied to IP)`;
             quotaTopic = `global-pixel-canvas-quota-v6/${myIp}`;
 
-            // Connect to MQTT
             client = mqtt.connect('wss://broker.emqx.io:8084/mqtt');
 
+            // Handle connection states
             client.on('connect', () => {
-                document.getElementById('status').innerText = "Connected to Cloud! (Live)";
-                document.getElementById('status').style.color = "#00b894";
+                setConnectionState(true);
                 client.subscribe(cloudTopic);
-                client.subscribe(quotaTopic); // Subscribe to personal IP quota
-                client.subscribe(votesTopic); // Subscribe to global clear votes
+                client.subscribe(quotaTopic);
+                client.subscribe(votesTopic); 
             });
+
+            client.on('offline', () => setConnectionState(false));
+            client.on('reconnect', () => setConnectionState(false));
+            client.on('close', () => setConnectionState(false));
+            client.on('error', () => setConnectionState(false));
 
             client.on('message', (topic, message) => {
                 if (topic === cloudTopic) {
@@ -162,8 +198,6 @@
                         votes = JSON.parse(message.toString());
                         updateVoteUI();
                         
-                        // If 10 or more votes are reached, clear the local board
-                        // (The 10th voter will publish the empty grid to cloudTopic)
                         if (Object.keys(votes).length >= 10) {
                             localGrid = {};
                             unackedPixels = {};
@@ -176,36 +210,34 @@
 
         // --- VOTING LOGIC ---
         function updateVoteUI() {
+            if (!isConnected) return; // Don't update if offline
+
             const count = Object.keys(votes).length;
             document.getElementById('voteCountText').innerText = `Votes: ${count} / 10`;
             
-            const btn = document.getElementById('voteBtn');
             if (votes[myIp]) {
-                btn.disabled = true;
-                btn.innerText = "Voted";
+                voteBtn.disabled = true;
+                voteBtn.innerText = "Voted";
             } else {
-                btn.disabled = false;
-                btn.innerText = "Vote to Clear Board";
+                voteBtn.disabled = false;
+                voteBtn.innerText = "Vote to Clear Board";
             }
         }
 
         function castVote() {
-            if (!myIp || votes[myIp]) return;
+            if (!isConnected || !myIp || votes[myIp]) return;
             
             votes[myIp] = true;
             const count = Object.keys(votes).length;
             
             if (count >= 10) {
-                // We are the 10th vote! Clear the board and reset votes globally.
                 client.publish(cloudTopic, JSON.stringify({}), { retain: true });
                 client.publish(votesTopic, JSON.stringify({}), { retain: true });
                 
-                // Clear locally immediately
                 localGrid = {};
                 unackedPixels = {};
                 renderCanvas();
             } else {
-                // Publish the updated votes object
                 client.publish(votesTopic, JSON.stringify(votes), { retain: true });
             }
             
@@ -221,8 +253,9 @@
 
         setInterval(calculatePixels, 1000);
 
+        // Batch Syncing Server Logic (Now strictly requires connection)
         setInterval(() => {
-            if (needsSync && client) {
+            if (needsSync && client && isConnected) {
                 client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
                 needsSync = false;
             }
@@ -255,7 +288,7 @@
         }
 
         function handleDraw(e) {
-            if (!isDrawing) return;
+            if (!isDrawing || !isConnected) return; // Prevent completely if offline
 
             const rect = canvas.getBoundingClientRect();
             const scaleX = canvas.width / rect.width;
@@ -266,7 +299,7 @@
 
             if (x < 0 || x >= 100 || y < 0 || y >= 100) return;
 
-            const color = document.getElementById('colorPicker').value;
+            const color = colorPicker.value;
             let pointsToDraw = [];
 
             if (lastDrawnX === -1) {
@@ -308,28 +341,31 @@
                 needsSync = true;
             }
             
-            if (quotaModified && client) {
+            if (quotaModified && client && isConnected) {
                 client.publish(quotaTopic, JSON.stringify({ basePixels, baseTime }), { retain: true });
             }
         }
 
         // --- TOUCH & MOUSE EVENTS ---
         canvas.addEventListener('pointerdown', (e) => {
+            if (!isConnected) return;
             isDrawing = true;
             if (clearUnackedTimeout) clearTimeout(clearUnackedTimeout);
             handleDraw(e);
         });
 
         canvas.addEventListener('pointermove', (e) => {
+            if (!isConnected) return;
             handleDraw(e);
         });
 
         const stopDrawing = () => {
+            if (!isDrawing) return;
             isDrawing = false;
             lastDrawnX = -1;
             lastDrawnY = -1;
             
-            if (needsSync && client) {
+            if (needsSync && client && isConnected) {
                 client.publish(cloudTopic, JSON.stringify(localGrid), { retain: true });
                 needsSync = false;
             }
@@ -349,3 +385,14 @@
     </script>
 </body>
 </html>
+
+
+
+
+
+
+
+
+
+
+
